@@ -91,7 +91,6 @@ lws_tls_reuse_session(struct lws *wsi)
 	}
 
 	lwsl_tlssess("%s: %s\n", __func__, (const char *)&ts[1]);
-	wsi->tls_session_reused = 1;
 
 	if (!SSL_set_session(wsi->tls.ssl, ts->session)) {
 		lwsl_err("%s: session not set for %s\n", __func__, tag);
@@ -158,7 +157,6 @@ lws_tls_session_expiry_cb(lws_sorted_usec_list_t *sul)
 	struct lws_vhost *vh = lws_container_of(ts->list.owner,
 						struct lws_vhost, tls_sessions);
 
-	lws_sul_cancel(&ts->sul_ttl);
 	lws_context_lock(vh->context, __func__); /* -------------- cx { */
 	lws_vhost_lock(vh); /* -------------- vh { */
 	__lws_tls_session_destroy(ts);
@@ -304,7 +302,8 @@ bail:
  * On mbedtls and some version at least of borning ssl, this cb is either not
  * part of the tls library apis or fails to arrive.
  *
- *
+ * This synthetic cb is called instead for those build cases, scheduled for
+ * +500ms after the tls negotiation completed.
  */
 
 void
@@ -319,9 +318,18 @@ lws_sess_cache_synth_cb(lws_sorted_usec_list_t *sul)
 		return;
 
 	sess = SSL_get1_session(tls->ssl);
+	if (!sess)
+		return;
 
-	if (SSL_SESSION_is_resumable(sess))
-		lws_tls_session_new_cb(tls->ssl, sess);
+	if (!SSL_SESSION_is_resumable(sess) || /* not worth caching, or... */
+	    !lws_tls_session_new_cb(tls->ssl, sess)) { /* ...cb didn't keep it */
+		/*
+		 * For now the policy if no session message after the wait,
+		 * is just let it be.  Typically the session info is sent
+		 * early.
+		 */
+		SSL_SESSION_free(sess);
+	}
 }
 #endif
 
@@ -408,7 +416,7 @@ lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port,
 {
 	struct lws_tls_session_dump d;
 	lws_tls_sco_t *ts;
-	SSL_SESSION *sess;
+	SSL_SESSION *sess = NULL; /* allow it to "bail" early */
 	void *v;
 
 	if (vh->options & LWS_SERVER_OPTION_DISABLE_TLS_SESSION_CACHE)
